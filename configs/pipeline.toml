@@ -1,0 +1,19 @@
+# 管线默认阶段配置：只放受版本控制的配置，命令模板以 argv 方式展开
+# （与 scripts/pipeline.py 的信任边界约定一致）
+
+[stages]
+order = ["priors", "colmap", "match", "propagate", "postprocess", "traits", "quality"]
+
+[match]
+score_threshold = 0.1
+min_support_points = 3
+
+[propagate]
+min_votes = 1
+
+[postprocess]
+voxel = 0.2
+min_frag_points = 50
+
+[traits]
+coordinate_unit = "cm"

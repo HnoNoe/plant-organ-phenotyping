@@ -1,0 +1,8 @@
+# 合成演示数据集配置：scripts/pipeline.py --dataset synthetic_demo 使用
+
+[dataset]
+name = "synthetic_demo"
+sparse_dir = "examples/data/synthetic_demo/sparse/0"
+masks_dir = "examples/data/synthetic_demo/masks"
+dense_path = "examples/data/synthetic_demo/dense.npy"
+stem_label = 0
