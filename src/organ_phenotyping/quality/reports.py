@@ -35,7 +35,7 @@ def write_postprocess_diagnostics(merge_report, meas_count, viz_count, out_dir):
 
 def write_traits(per_organ, plant, out_dir):
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "traits.csv"), "w", newline="encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "traits.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["global_id", "type", "n_points", "area",
                                           "length", "width", "inclination_deg"])
         w.writeheader()
