@@ -28,21 +28,27 @@ from scipy.optimize import linear_sum_assignment
 
 @dataclass
 class MatchConfig:
-    score_threshold: float = 0.1      # 视角对匹配的最低 Jaccard
+    score_threshold: float = 0.1      # 视角对匹配的最低分数
     min_support_points: int = 3       # 全局叶片至少需要的支撑点数，低于则 warning
-    use_mask_iou: bool = False        # True 时用投影像素 IoU 代替支撑点 Jaccard
+    use_mask_iou: bool = False        # True 时用投影像素 IoU 代替支撑点分数
+    score_mode: str = "jaccard"       # jaccard | overlap（overlap=|∩|/min，抗碎片）
+    multi_hit_support: bool = False   # True 时一个支撑点可属于多个重叠实例掩码
+    rescue_threshold: float = 0.0     # >0 时启用"碎片抢救"：低于主阈值但高于此值的
+                                      # 孤立实例二次并入最优组件（记录在 rescued_edges）
 
 
 @dataclass
 class Diagnostics:
     pair_reports: list = field(default_factory=list)
     rejected_edges: list = field(default_factory=list)
+    rescued_edges: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
 
     def to_dict(self):
         return {
             "pair_reports": self.pair_reports,
             "rejected_edges": self.rejected_edges,
+            "rescued_edges": self.rescued_edges,
             "warnings": self.warnings,
         }
 
@@ -83,11 +89,12 @@ def project_points(xyz, qvec, tvec, camera):
     return u, v, z, valid & (u >= 0) & (u < W) & (v >= 0) & (v < H)
 
 
-def build_support(images, points3d, cameras, masks):
+def build_support(images, points3d, cameras, masks, cfg: MatchConfig | None = None):
     """每个 (image, instance) 的支撑稀疏点集合。
 
     返回 support[img][inst] = set(point_id)
     """
+    cfg = cfg or MatchConfig()
     support = {}
     for img_name, (cam_id, qvec, tvec, _xys, _pids) in images.items():
         cam = cameras[cam_id]
@@ -102,17 +109,26 @@ def build_support(images, points3d, cameras, masks):
         for idx, pid in enumerate(pid_list):
             if not valid[idx]:
                 continue
-            px, py = uv[idx]
+            px, py = int(round(uv[idx][0])), int(round(uv[idx][1]))
+            mh, mw = next(iter(inst_masks.values())).shape
+            if not (0 <= px < mw and 0 <= py < mh):
+                continue
             for inst, m in inst_masks.items():
-                if m[int(round(py)), int(round(px))]:
+                if m[py, px]:
                     sup[inst].add(int(pid))
-                    break  # 一个点只记第一个命中的实例（掩码不应重叠）
+                    if not cfg.multi_hit_support:
+                        break  # 默认一个点只记第一个命中的实例；multi_hit 时计入所有命中
         support[img_name] = sup
     return support
 
 
 def _pair_score(sup_a, sup_b, cfg: MatchConfig):
     inter = len(sup_a & sup_b)
+    if cfg.score_mode == "overlap":
+        # overlap 系数：|∩|/min(|A|,|B|)。对"小支撑集被掩码重叠切碎"鲁棒，
+        # 代价是对方更大时会高估——靠 score_threshold 与冲突保护兜底。
+        denom = min(len(sup_a), len(sup_b))
+        return inter / denom if denom else 0.0
     union = len(sup_a | sup_b)
     if union == 0:
         return 0.0
@@ -122,6 +138,7 @@ def _pair_score(sup_a, sup_b, cfg: MatchConfig):
 def match_all_pairs(images, support, cfg: MatchConfig, diag: Diagnostics):
     """逐视角对匈牙利指派，返回候选边列表 [(score, (img_a, inst_a), (img_b, inst_b))]。"""
     edges = []
+    pair_scores = {}  # (ea, eb) -> score，含被拒边，供"碎片抢救"复用
     imgs = sorted(support.keys())
     for img_a, img_b in itertools.combinations(imgs, 2):
         sup_a = support[img_a]
@@ -140,6 +157,7 @@ def match_all_pairs(images, support, cfg: MatchConfig, diag: Diagnostics):
             score = float(S[i, j])
             ea = (img_a, insts_a[i])
             eb = (img_b, insts_b[j])
+            pair_scores[(ea, eb)] = score
             if score >= cfg.score_threshold:
                 edges.append((score, ea, eb))
                 pair_report["accepted"].append({"a": list(ea), "b": list(eb), "score": score})
@@ -147,7 +165,7 @@ def match_all_pairs(images, support, cfg: MatchConfig, diag: Diagnostics):
                 pair_report["rejected"].append({"a": list(ea), "b": list(eb), "score": score})
         diag.pair_reports.append(pair_report)
     edges.sort(key=lambda e: -e[0])
-    return edges
+    return edges, pair_scores
 
 
 class _UnionFind:
@@ -168,8 +186,10 @@ class _UnionFind:
         return False
 
 
-def build_global_instances(edges, support, cfg: MatchConfig, diag: Diagnostics):
+def build_global_instances(edges, support, cfg: MatchConfig, diag: Diagnostics,
+                           pair_scores=None):
     """按分数降序建图；同视图冲突（组件在某视角已占实例）的边拒绝。返回全局实例列表。"""
+    pair_scores = pair_scores or {}
     nodes = [(img, inst) for img, sup in support.items() for inst in sup]
     uf = _UnionFind(nodes)
     comp_view_inst = {}  # root -> {img: inst}
@@ -202,6 +222,51 @@ def build_global_instances(edges, support, cfg: MatchConfig, diag: Diagnostics):
     for node in nodes:
         groups.setdefault(uf.find(node), []).append(node)
 
+    # ---- 碎片抢救：孤立（单视图）组件二次并入最优匹配组件 ----
+    if cfg.rescue_threshold > 0:
+        comp_root = {node: uf.find(node) for node in nodes}
+        comp_members = {}
+        for node, r in comp_root.items():
+            comp_members.setdefault(r, []).append(node)
+        # 每个节点的最佳跨组件边分数
+        best_cross = {}  # node -> (score, other_node)
+        for (ea, eb), s in pair_scores.items():
+            ra, rb = comp_root[ea], comp_root[eb]
+            if ra == rb:
+                continue
+            for a, b in ((ea, eb), (eb, ea)):
+                if s > best_cross.get(a, (0.0, None))[0]:
+                    best_cross[a] = (s, b)
+        for r, members in comp_members.items():
+            if len(members) != 1:
+                continue
+            node = members[0]
+            if node not in best_cross:
+                continue
+            s, other = best_cross[node]
+            if s < cfg.rescue_threshold:
+                continue
+            ro = uf.find(other)
+            if ro == r:
+                continue
+            views_mine = {node[0]: node[1]}
+            views_other = comp_view_inst.get(ro, {})
+            if any(img in views_mine and views_mine[img] != inst
+                   for img, inst in views_other.items()):
+                continue  # 同视图冲突，不抢救
+            uf.union(node, other)
+            root = uf.find(node)
+            merged = dict(views_other)
+            merged.update(views_mine)
+            comp_view_inst.pop(ro, None)
+            comp_view_inst[root] = merged
+            diag.rescued_edges.append(
+                {"edge": [list(node), list(other)], "score": s})
+
+        groups = {}
+        for node in nodes:
+            groups.setdefault(uf.find(node), []).append(node)
+
     instances = []
     for gid, members in enumerate(sorted(groups.values(), key=lambda ms: -len(ms))):
         mem_map = {img: inst for img, inst in members}
@@ -218,6 +283,7 @@ def build_global_instances(edges, support, cfg: MatchConfig, diag: Diagnostics):
             "members": mem_map,
             "n_views": len(members),
             "support_points": len(support_pts),
+            "support_point_ids": sorted(support_pts),
             "best_pair_score": best,
         }
         if len(support_pts) < cfg.min_support_points:
@@ -235,7 +301,7 @@ def run_matching(images, points3d, cameras, masks, cfg: MatchConfig | None = Non
     """端到端：支撑 -> 逐对匹配 -> 全局身份。返回 (instances, diagnostics)。"""
     cfg = cfg or MatchConfig()
     diag = Diagnostics()
-    support = build_support(images, points3d, cameras, masks)
-    edges = match_all_pairs(images, support, cfg, diag)
-    instances = build_global_instances(edges, support, cfg, diag)
+    support = build_support(images, points3d, cameras, masks, cfg)
+    edges, pair_scores = match_all_pairs(images, support, cfg, diag)
+    instances = build_global_instances(edges, support, cfg, diag, pair_scores)
     return instances, diag, support
