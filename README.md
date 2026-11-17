@@ -28,6 +28,22 @@ python scripts/pipeline.py --dataset synthetic_demo   # 端到端六阶段
 产物在 `outputs/synthetic_demo/`：`traits.csv`、`plant_traits.json`、
 `matching_diagnostics.json`、`postprocess_diagnostics.json`。
 
+**有真实视频？** 直接出点云和单株分析：
+
+```bash
+python tools/scan_video.py --video plant.mp4 --out recon1   # 视频→稠密点云
+python tools/analyze_plant.py recon1/dense/fused.ply recon1/main --radius 1.2
+```
+
+拍摄规范与实测数据见 [docs/VIDEO.md](docs/VIDEO.md)。
+
+**做方法研究？** 5plant 真值基准 + 参数扫描：
+
+```bash
+python examples/make_5plant_dataset.py <5plant_labeled.txt> my_plant 12
+python examples/sweep_match_params.py my_plant   # 匹配机制 A/B 对比
+```
+
 ## 设计原则（与 GeoProMatch 论文契约一致）
 
 1. **可审计**：每个全局器官可追溯到具体视图的实例支撑；被拒绝的匹配边记录理由；
@@ -47,6 +63,7 @@ python scripts/pipeline.py --dataset synthetic_demo   # 端到端六阶段
 ```
 configs/          管线与数据集配置（TOML）
 scripts/pipeline.py  阶段式入口
+tools/            视频扫描工具链（视频→点云→单株分析，见 docs/VIDEO.md）
 src/organ_phenotyping/
   priors/         2D 先验读取（RGBA 透明 PNG / npz 掩码）
   matching/       projection_hungarian 跨视图匹配 ★
@@ -54,9 +71,9 @@ src/organ_phenotyping/
   organs/         器官后处理
   traits/         表型量测
   quality/        审计报告输出
-examples/         合成数据生成器
+examples/         合成 / 5plant 真值基准数据生成器 + 参数扫描
 tests/            匹配核心单元测试
-docs/             架构、评测、复现文档
+docs/             架构、评测、复现、视频扫描文档
 ```
 
 ## 许可

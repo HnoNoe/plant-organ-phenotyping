@@ -1,0 +1,8 @@
+# 5plant 真实植物基准（benthi_control_A_D04，12 视角）
+
+[dataset]
+name = "plant5_benthi_A_D04"
+sparse_dir = "examples/data/plant5_benthi_A_D04/sparse/0"
+masks_dir = "examples/data/plant5_benthi_A_D04/masks"
+dense_path = "examples/data/plant5_benthi_A_D04/dense.npy"
+stem_label = 0
